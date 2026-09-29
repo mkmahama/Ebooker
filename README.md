@@ -1,107 +1,114 @@
 # Drop Shelf v1
 
-A Telegram-native ebook shop for AI and workflow-automation guides. Three surfaces:
+A Telegram-native ebook shop for AI and workflow-automation guides.
 
-- **Bot (@YourShelfBot)**: free chapter, shelf, Telegram Stars (`XTR`) checkout, instant delivery, re-download library, referrals, payment support.
-- **Web page**: TON checkout through TON Connect, about 12% cheaper, with signed, expiring download links.
-- **Channel (@YourShelf)**: launch posts with deep links into the bot (and the web page).
+- **Telegram bot** (@YourShelfBot): free sample, shelf, library, referrals, support. Sells digital goods **only in Telegram Stars (`XTR`)**.
+- **Web checkout**: the same books for **TON** via TON Connect, about 12% cheaper (no app-store cut).
+- **Channel**: drop announcements with deep links into the bot.
 
-The bot is Stars-only: it never shows TON prices or links to the web checkout (a test enforces this). TON is promoted from the channel and the web.
+No npm dependencies. Everything runs on Node 22's built-ins (`node:sqlite`, `node:http`, `fetch`, `crypto`); the browser loads TON Connect UI 2.4.4 from unpkg.
 
 ## Quick start
 
 ```bash
-cp .env.example .env         # fill in BOT_TOKEN, PUBLIC_URL, WEBHOOK_SECRET, DOWNLOAD_SECRET, TON_WALLET_ADDRESS...
-npm install
-npm run seed                 # creates the database and the three drops + bundle
-npm start                    # web server, webhook/polling bot, TON watcher
-npm test                     # 30 tests, no network needed
+cp .env.example .env        # fill in BOT_TOKEN, LINK_SECRET, TON_RECEIVER_ADDRESS, ...
+npm run placeholders        # placeholder EPUB/PDF/sample files so every flow works today
+npm test                    # 41 tests
+npm start                   # web server + bot + TON wallet watcher in one process
 ```
 
-Requires Node 22.13+ (uses the built-in `node:sqlite`). Only runtime dependency: `pdf-lib` (buyer-id stamping).
-Enable Stars payments for the bot in @BotFather. For local development set `BOT_MODE=polling`.
+Requires **Node 22.5+**. For local development use `BOT_MODE=polling` and `TON_NETWORK=testnet`.
 
-## Bot commands
+### One-time Telegram setup
 
-Exactly seven commands are registered; everything else is inline buttons.
+1. Create the bot with @BotFather and put the token in `BOT_TOKEN`. Stars payments need no provider token.
+2. Create a **private support group**, add the bot, and put the group id in `SUPPORT_CHAT_ID`. `/paysupport` threads land there. Turn on **Topics** in the group and give the bot the *Manage topics* admin right, and every ticket gets its own forum topic. Without topics, tickets fall back to reply threads.
+3. Create the channel (`CHANNEL_ID`) and make the bot an admin that can post.
+4. Commands register themselves on startup (`setMyCommands`), exactly the seven below.
 
-| Command | Behaviour |
-|---|---|
-| `/start` | Welcome + "Get a free chapter", "Browse the shelf", "My library". Deep-link payloads: `sample`, `sample_<source>`, `shelf`, `library`, `buy_<slug>`, `book_<slug>`, `ref_<code>`, `claim_<token>` (all logged to `events`) |
-| `/shelf` | Active books, current drop first: cover, pitch, launch/full price, **Buy** and **Free chapter** |
-| `/sample` | Sends the lead magnet (AI daily brief guide PDF + n8n JSON) and opts into drop alerts |
-| `/library` | Owned books with EPUB and PDF re-download buttons |
-| `/invite` | Personal referral link and "2 of 3 referrals to your free book" |
-| `/help` | FAQ, refund policy, contact button |
-| `/paysupport` | Opens a support ticket: a forum topic (or reply thread) in the staff group; messages relay both ways |
+### Production
 
-## Payments
+- Serve over HTTPS at `PUBLIC_URL` (TON Connect and Telegram webhooks both require it), e.g. behind Caddy or nginx.
+- Set `BOT_MODE=webhook`. The app calls `setWebhook` to `PUBLIC_URL/tg/webhook` with `WEBHOOK_SECRET` and verifies the secret header on every update. If Telegram is unreachable at boot, the web checkout keeps running and the webhook retries every 60 s.
+- Set `TON_NETWORK=mainnet` only after a full testnet purchase. A `TONCENTER_API_KEY` raises the watcher's rate limit.
+- Back up `data/dropshelf.db` (SQLite, WAL mode).
 
-**Stars.** `sendInvoice` with `currency: "XTR"` and an empty `provider_token`; the invoice payload is an id in the `invoices` table.
-`pre_checkout_query` is answered from local DB reads only (checks user, amount, currency, invoice age, availability, not already owned) and, in webhook mode, before the HTTP response is returned.
-Files are delivered only on `successful_payment`; `telegram_payment_charge_id` is stored as `purchases.charge_id` (unique, so duplicate updates are no-ops).
-Refunds: `npm run admin -- refund <charge_id>` calls `refundStarPayment` and sends the refund confirmation. `refunded_payment` updates are recorded too.
+## How it maps to the spec
 
-**TON.** `POST /api/orders` creates an order `DS-XXXXXXXXXX` and returns the TON Connect message: receiving address, amount in nanotons, and a `payload` BOC holding the order id as a text comment (hand-built; tests check it byte for byte against `@ton/core`).
-The watcher polls toncenter `getTransactions` for the wallet and marks an order paid when an incoming transfer has that exact comment and at least the amount (underpayments and duplicates are logged, not honoured; late payments on expired orders are honoured).
-The page polls `GET /api/orders/:id?token=...` (the access token never goes on-chain) and then shows HMAC-signed links `/download/:order/:book/:format?exp&sig` that expire after `DOWNLOAD_TTL_HOURS`. A **Claim in Telegram** deep link adds the web purchase (with its tx hash) to the buyer's `/library`.
+### Boundaries
+| Surface | Pays with | Notes |
+| --- | --- | --- |
+| Bot | Stars only | No TON prices, wallets or web-checkout links anywhere in bot messages or buttons. A test scans every bot output to enforce this. |
+| Web page | TON only | Links to the bot for Stars buyers. |
+| Channel posts | Stars only | Posted by the bot, so they follow the bot rule: Stars prices and deep links into the bot, no TON prices or web-checkout links. Promote the web page from your own site or socials. |
 
-TON prices are derived from the current Stars price: `stars × STAR_USD × (1 − TON_DISCOUNT) ÷ TON/USD`, rounded up to 0.01 TON. `TON_PRICING_MODE=fixed` uses `TON_USD_RATE`; `usd_peg` refreshes the rate from `TON_RATE_URL` every `TON_RATE_REFRESH_HOURS`. The amount is locked when an order is created.
+### Bot commands (exactly 7; everything else is inline buttons)
+| Command | Behavior |
+| --- | --- |
+| `/start` | Welcome + **Get a free chapter / Browse the shelf / My library**. Deep links: `sample`, `sample_<book>`, `buy_<book>`, `ref_<CODE>`, `claim_<CODE>`, `shelf`, `library`. The first payload is stored as the user's source. |
+| `/shelf` | Live books, current drop first, cover (if `cover.jpg` exists), pitch, price (launch countdown), **Buy** and **Free chapter**. Owned books show **Download**. |
+| `/sample` | Sends the AI daily brief chapter PDF + n8n workflow JSON and opts the user into drop alerts. |
+| `/library` | Every owned book with EPUB and PDF re-download buttons (ownership checked on every tap). |
+| `/invite` | Personal link `t.me/<bot>?start=ref_<CODE>` and progress, e.g. "2 of 3 referrals to your free book". A referral counts once the invited user buys. |
+| `/help` | FAQ, refund policy, Contact button, alert toggle. |
+| `/paysupport` | Opens a ticket (one open per user) in its own forum topic of the support group, headed by the user's recent charge ids. Messages relay both ways; agents just write in the topic (or reply to a relayed message when topics are off). `!close` or the user's *Close ticket* button closes the ticket and its topic. |
 
-## Data
+### Stars checkout
+1. **Buy** → `sendInvoice` with `currency: "XTR"`, a 32-char-safe invoice title and payload `v1|<book>|<price>|<issued_at>`.
+2. `pre_checkout_query` is answered from local SQLite in milliseconds. It rejects tampered amounts, non-XTR currency, hidden books, already-owned books, and stale prices (an invoice keeps its quoted price for one hour, so a launch-price invoice paid just after the window closes still works).
+3. Files are sent **only** on `successful_payment`. The purchase row (with `telegram_payment_charge_id`) is written first, then files go out, then it is marked delivered. If delivery fails, the webhook answers 500 (the poller holds its offset) so Telegram redelivers the update; the retry resends only undelivered files and never double-records. If two parallel invoices are both paid, the second is refunded automatically with `refundStarPayment`.
+4. Files upload once; later deliveries reuse Telegram's `file_id`.
 
-Per user (`users` + `purchases`; `store.getUserProfile(id)` returns it in this shape):
+Refund manually: `npm run refund -- <charge_id | purchase_id>`.
 
-```json
-{ "telegram_user_id": 123, "referral_code": "K7PQ2M9X", "referrer_id": 456, "alert_opt_in": true,
-  "purchases": [{ "book_id": 1, "method": "stars", "stars_paid": 300, "ton_paid_nano": null,
-                  "charge_id": "stxABC...", "created_at": 1790000000000, "refunded_at": null }] }
-```
+### TON checkout
+1. `POST /api/orders` creates order `DS-XXXXXXXX` (8-char code, 30-min TTL) and returns a TON Connect transaction: receiver, amount in nanotons, and a BOC-encoded **text comment containing the order id**. The encoder is byte-identical to `@ton/core` (tested against a known vector).
+2. The watcher polls toncenter v2 `getTransactions` every 10 s (paging back until it reaches seen transactions), matches the comment and requires `amount ≥ price`. It records the transaction hash; overpayments are accepted, underpayments are flagged, and late payments within 24 h of expiry are still credited. Every sale and anomaly is posted to the support group.
+3. The page polls `GET /api/orders/:id` with a **private view key** (the order id is public on-chain, so it alone never unlocks files). Once paid it shows **signed, expiring** EPUB/PDF links (HMAC-SHA256, `LINK_TTL_MINUTES`) and an optional **Add to my Telegram library** deep link (`claim_<CODE>`, single use).
+4. Buyers without TON Connect can pay manually with the displayed amount, address and comment.
 
-`charge_id` is the Stars charge id, the TON tx hash, or `referral:<user>` for a referral reward. Other tables: `books`, `invoices`, `ton_orders`, `ton_seen_tx`, `support_tickets`, `support_messages`, `file_cache`, `events`, `kv` (see `src/db/schema.sql`).
+### Data model (`src/db.js`)
+- `users`: `telegram_user_id` (PK), `referral_code`, `referrer_id`, `alert_opt_in`, `referral_rewarded`, `first_source`.
+- `purchases`: one row per owned book: `book_id`, `method` (stars / ton / referral / gift), `stars_paid` or `ton_paid_nano`, `charge_id` or `tx_hash`, `created_at`, `refunded_at`. `db.getUserWithPurchases(id)` returns the user with this **purchases array**. A normalized table (instead of a JSON column) lets SQLite enforce one active copy per book and unique charge ids / tx hashes.
+- `ton_orders`, `ton_seen_tx`, `support_tickets`, `support_relay`, `file_cache`, `books`.
 
-## Catalog (seeded)
+### Catalog (seeded on first start)
+| # | Book id | Launch | Full | Web (TON) at full |
+| --- | --- | --- | --- | --- |
+| 1 | `ai-control-center`: Telegram as Your AI Control Center | 300 ⭐ | 450 ⭐ | 1.98 |
+| 2 | `ai-channel-automation`: Automate Your Telegram Channel with AI | 200 ⭐ | 300 ⭐ | 1.32 |
+| 3 | `first-ai-workflow`: Zapier vs Make vs n8n: Ship Your First AI Workflow in a Weekend | 100 ⭐ | 150 ⭐ | 0.66 |
 
-| Slug | Book | Launch / full |
-|---|---|---|
-| `ai-control-center` (current drop) | Telegram as Your AI Control Center | 300 / 450 Stars |
-| `automate-channel-ai` | Automate Your Telegram Channel with AI | 200 / 300 Stars |
-| `first-ai-workflow-weekend` | Zapier vs Make vs n8n: Ship Your First AI Workflow in a Weekend | 100 / 150 Stars |
-| `drop-shelf-bundle` | All three | 600 Stars |
+TON prices = Stars × `TON_PER_STAR` × (1 − `TON_DISCOUNT`), rounded up to 0.01 TON. **Update `TON_PER_STAR` when the TON price moves.** Launch prices apply only inside a launch window you start with `npm run drop`.
 
-The launch price applies until `launch_ends_at`. It stays open-ended until you run `launch`, which starts the 48-hour window. Add the actual EPUB/PDF files under `storage/` (see `storage/README.md`).
-
-## Operating the shop
+## Running drops
 
 ```bash
-npm run admin -- books                        # prices and launch windows
-npm run admin -- launch automate-channel-ai   # make it the current drop, start 48h launch price, alert subscribers, post to channel
-npm run admin -- end-launch ai-control-center # switch to full price now
-npm run admin -- set ai-control-center reader_group_url https://t.me/+invite
-npm run admin -- refund <charge_id>
-npm run admin -- user <telegram_user_id>
-npm run admin -- orders
-npm run admin -- stats                        # sample->purchase rate, Stars vs TON split, referral share, refund rate, opt-ins
+npm run drop -- list                                   # prices, status, missing files
+npm run drop -- launch ai-control-center --hours 48 --announce   # launch price for 48h, feature it, post to channel, alert subscribers
+npm run drop -- announce ai-channel-automation --channel-only
+npm run drop -- hide first-ai-workflow                 # take off the shelf
 ```
 
-The free chapter PDF is generated from `content/samples/lead-magnet/ai-daily-brief.md` with `node scripts/build-sample-pdf.js`.
+Alerts go only to opted-in users, skip people who already own the book, stay under Telegram's rate limits, and unsubscribe anyone who blocked the bot.
 
-## Layout
+## Replacing the placeholder content
 
 ```
-src/index.js            entry: web server, webhook/polling, TON watcher
-src/app.js              service wiring (shared with the admin CLI)
-src/bot/bot.js          commands, Stars payments, delivery, referrals, support threads, drop alerts
-src/bot/messages.js     all user-facing copy (receipt, delivery, drop alert, refund, referral reward...)
-src/store.js            data access
-src/pricing.js          launch window, TON pricing
-src/ton/                comment BOC, orders, wallet watcher
-src/web/                HTTP server, signed links, checkout page (public/)
-src/files/storage.js    book files, samples, PDF stamping
-scripts/                seed, admin CLI, sample PDF builder
-content/samples/        the free chapter (guide PDF + n8n workflow JSON)
+content/sample/daily-brief-chapter.pdf       free chapter (lead magnet)
+content/sample/daily-brief-workflow.json     n8n workflow (starter; export your tested version over it)
+content/books/<book-id>/book.epub
+content/books/<book-id>/book.pdf
+content/books/<book-id>/sample.pdf           optional per-book free chapter
+content/books/<book-id>/cover.jpg            optional; shown in /shelf and channel posts
+public/icon.png                              180x180 icon for TON Connect wallets
 ```
 
-## Not in v1
+Replacing a file is enough: the bot notices the new modification time and re-uploads it. `npm run placeholders` never overwrites existing files (add `--force` to regenerate).
 
-Emailing download links to web buyers, paid-media chapter previews in the channel, and the proof-of-purchase collectible (a `hooks.onPurchase` hook point exists in `Bot`).
+## Before launch checklist
+- [ ] Real EPUB/PDF files and the tested daily-brief workflow in `content/`
+- [ ] Rewrite `REFUND_POLICY` and the FAQ in `src/bot/bot.js` to match your terms
+- [ ] One full Stars purchase and one refund with a real account
+- [ ] One full TON purchase on **testnet**, then switch to mainnet
+- [ ] Confirm you can legally receive Stars/TON income where you live

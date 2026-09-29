@@ -1,106 +1,85 @@
-import { mkdtempSync, mkdirSync, writeFileSync, cpSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { PDFDocument } from 'pdf-lib';
-import { loadConfig } from '../src/config.js';
-import { openDb } from '../src/db/index.js';
-import { seedCatalog } from '../src/db/catalog.js';
-import { Store } from '../src/store.js';
-import { Files } from '../src/files/storage.js';
-import { Bot } from '../src/bot/bot.js';
-import { TonPricer } from '../src/pricing.js';
-import { TonOrders } from '../src/ton/orders.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { buildConfig } from '../src/config.js';
+import { openDb } from '../src/db.js';
 
-export const quietLog = { info() {}, warn() {}, error() {} };
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+let contentDir;
 
-/** Records every Bot API call and returns plausible results. */
-export class FakeApi {
-  constructor() {
-    this.calls = [];
-    this.nextMessageId = 1000;
-    this.failures = {};
-  }
-  async call(method, params = {}) {
-    this.calls.push({ method, params });
-    if (this.failures[method]) throw this.failures[method];
-    const message_id = this.nextMessageId++;
-    switch (method) {
-      case 'sendDocument': return { message_id, document: { file_id: `file-${message_id}` } };
-      case 'sendPhoto': return { message_id, photo: [{ file_id: `photo-${message_id}` }] };
-      case 'createForumTopic': return { message_thread_id: 77, name: params.name };
-      case 'copyMessage': return { message_id };
-      default: return { message_id };
-    }
-  }
-  of(method) { return this.calls.filter((c) => c.method === method); }
-  texts(chatId) { return this.calls.filter((c) => c.method === 'sendMessage' && (chatId === undefined || c.params.chat_id === chatId)).map((c) => c.params.text); }
-  reset() { this.calls = []; }
-}
-
-export async function makeStorage() {
-  const root = mkdtempSync(join(tmpdir(), 'dropshelf-'));
-  const storageDir = join(root, 'storage');
-  const contentDir = join(root, 'content');
-  const pdf = await PDFDocument.create();
-  pdf.addPage([400, 600]);
-  const pdfBytes = await pdf.save();
-  for (const slug of ['ai-control-center', 'automate-channel-ai', 'first-ai-workflow-weekend']) {
-    mkdirSync(join(storageDir, 'books', slug), { recursive: true });
-    writeFileSync(join(storageDir, 'books', slug, `${slug}.pdf`), pdfBytes);
-    writeFileSync(join(storageDir, 'books', slug, `${slug}.epub`), Buffer.from(`PK epub ${slug}`));
-  }
-  mkdirSync(join(storageDir, 'covers'), { recursive: true });
-  cpSync(new URL('../content/samples/lead-magnet', import.meta.url).pathname, join(contentDir, 'samples', 'lead-magnet'), { recursive: true });
-  return { root, storageDir, contentDir };
-}
-
-export async function makeApp(overrides = {}) {
-  const { storageDir, contentDir } = await makeStorage();
-  const config = loadConfig({
-    BOT_TOKEN: 'test', BOT_USERNAME: 'YourShelfBot', PUBLIC_URL: 'https://shop.example',
-    SUPPORT_CHAT_ID: '-100500', DOWNLOAD_SECRET: 'secret', WEBHOOK_SECRET: 'hook',
-    TON_WALLET_ADDRESS: 'UQShopWallet', TON_USD_RATE: '3', ...overrides,
+/** Placeholder content generated once into a temp dir. */
+export function testContentDir() {
+  if (contentDir) return contentDir;
+  contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dropshelf-content-'));
+  execFileSync(process.execPath, ['--no-warnings=ExperimentalWarning', 'scripts/make-placeholders.js', '--force'], {
+    cwd: ROOT, env: { ...process.env, CONTENT_DIR: contentDir }, stdio: 'ignore',
   });
-  config.storageDir = storageDir;
-  config.contentDir = contentDir;
-  const db = openDb(':memory:');
-  seedCatalog(db);
-  const store = new Store(db);
-  const api = new FakeApi();
-  const files = new Files({ storageDir, contentDir });
-  const bot = new Bot({ api, store, files, config, log: quietLog });
-  const pricer = new TonPricer(config.ton, { log: quietLog });
-  const orders = new TonOrders({ store, pricer, config });
-  return { config, db, store, api, files, bot, pricer, orders };
+  return contentDir;
 }
 
-let updateId = 1;
-export const user = (id, extra = {}) => ({ id, is_bot: false, first_name: `User${id}`, username: `user${id}`, ...extra });
+export function makeCfg(over = {}) {
+  return {
+    ...buildConfig({
+      BOT_TOKEN: 'test', BOT_USERNAME: 'YourShelfBot', WEBHOOK_SECRET: 'whsecret-123',
+      SUPPORT_CHAT_ID: '-100999', SUPPORT_USERNAME: 'ShelfSupport', CHANNEL_ID: '@YourShelf',
+      PUBLIC_URL: 'https://shop.test', LINK_SECRET: 'x'.repeat(40), TON_RECEIVER_ADDRESS: 'UQTESTRECEIVER',
+      TON_PER_STAR: '0.005', TON_DISCOUNT: '0.12', REFERRAL_GOAL: '3', REFERRAL_REWARD_BOOK_ID: 'first-ai-workflow',
+      CONTENT_DIR: testContentDir(),
+    }),
+    ...over,
+  };
+}
 
-export const textUpdate = (from, text) => ({
-  update_id: updateId++,
-  message: { message_id: updateId, from, chat: { id: from.id, type: 'private' }, date: 0, text },
-});
+export function makeDb() {
+  return openDb(':memory:');
+}
 
-export const callbackUpdate = (from, data) => ({
-  update_id: updateId++,
-  callback_query: { id: `cq${updateId}`, from, data, message: { message_id: 1, chat: { id: from.id, type: 'private' } } },
-});
-
-/** Runs the full Stars flow for a user and product: invoice -> pre_checkout -> successful_payment. */
-export async function buyWithStars(app, from, slug, chargeId = `charge-${from.id}-${slug}`) {
-  const book = app.store.getBookBySlug(slug);
-  await app.bot.handleUpdate(callbackUpdate(from, `buy:${book.id}`));
-  const inv = app.api.of('sendInvoice').at(-1).params;
-  await app.bot.handleUpdate({ update_id: updateId++, pre_checkout_query: { id: `pcq${updateId}`, from, currency: 'XTR', total_amount: inv.prices[0].amount, invoice_payload: inv.payload } });
-  const answer = app.api.of('answerPreCheckoutQuery').at(-1).params;
-  if (!answer.ok) throw new Error(`pre-checkout rejected: ${answer.error_message}`);
-  await app.bot.handleUpdate({
-    update_id: updateId++,
-    message: {
-      message_id: updateId, from, chat: { id: from.id, type: 'private' }, date: 0,
-      successful_payment: { currency: 'XTR', total_amount: inv.prices[0].amount, invoice_payload: inv.payload, telegram_payment_charge_id: chargeId, provider_payment_charge_id: '' },
+/** Fake Bot API that records every call. */
+export function fakeApi({ fail = {} } = {}) {
+  let n = 100;
+  const calls = [];
+  const api = {
+    calls,
+    async call(method, params = {}) {
+      calls.push({ method, params });
+      if (fail[method]) throw fail[method];
+      switch (method) {
+        case 'sendMessage':
+        case 'copyMessage':
+        case 'sendPhoto':
+        case 'sendInvoice':
+          return { message_id: ++n };
+        case 'sendDocument': {
+          const id = ++n;
+          return { message_id: id, document: { file_id: `FILE_${id}` } };
+        }
+        default:
+          return true;
+      }
     },
+    of: (method) => calls.filter((c) => c.method === method),
+    clear: () => { calls.length = 0; },
+    texts: () => calls.flatMap((c) => [c.params.text, c.params.caption].filter(Boolean)),
+  };
+  return api;
+}
+
+export const silentLog = { info() {}, warn() {}, error() {} };
+
+let upd = 1;
+export function msgUpdate(from, text, extra = {}) {
+  return { update_id: upd++, message: { message_id: upd, from, chat: { id: from.id, type: 'private' }, date: 0, text, ...extra } };
+}
+export function cbUpdate(from, data) {
+  return { update_id: upd++, callback_query: { id: `cb${upd}`, from, data, message: { message_id: 1, chat: { id: from.id, type: 'private' } } } };
+}
+export function preCheckoutUpdate(from, { payload, amount, currency = 'XTR' }) {
+  return { update_id: upd++, pre_checkout_query: { id: `pcq${upd}`, from, currency, total_amount: amount, invoice_payload: payload } };
+}
+export function paidUpdate(from, { payload, amount, charge }) {
+  return msgUpdate(from, undefined, {
+    successful_payment: { currency: 'XTR', total_amount: amount, invoice_payload: payload, telegram_payment_charge_id: charge, provider_payment_charge_id: '' },
   });
-  return { invoice: inv, chargeId };
 }

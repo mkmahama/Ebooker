@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Drop Shelf · AI automation guides</title>
+  <meta name="description" content="Short, tested guides for AI and workflow automation you run from Telegram. Pay with TON.">
+  <link rel="icon" href="/icon.png">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="https://unpkg.com/@tonconnect/ui@2.4.4/dist/tonconnect-ui.min.js"></script>
+</head>
+<body>
+  <header class="top">
+    <div class="wrap top-row">
+      <a class="brand" href="/"><span class="mark" aria-hidden="true">▤</span> Drop Shelf</a>
+      <div id="ton-connect"></div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="hero">
+      <p class="eyebrow">AI &amp; workflow automation</p>
+      <h1>Tested n8n workflows you run from Telegram.</h1>
+      <p class="lede">Short guides with importable workflows. Pay with TON here, or with Stars inside our Telegram bot.</p>
+      <p id="net-note" class="net-note" hidden></p>
+    </section>
+
+    <section aria-labelledby="shelf-h">
+      <h2 id="shelf-h" class="section-h">On the shelf</h2>
+      <div id="books" class="books" aria-live="polite"><p class="muted">Loading the shelf…</p></div>
+    </section>
+
+    <section class="faq" aria-labelledby="faq-h">
+      <h2 id="faq-h" class="section-h">How it works</h2>
+      <ol class="steps">
+        <li><strong>Connect a TON wallet</strong> (Tonkeeper, Wallet in Telegram, MyTonWallet…).</li>
+        <li><strong>Confirm the transfer.</strong> The amount and order code are filled in for you.</li>
+        <li><strong>Download</strong> EPUB and PDF as soon as the payment lands, usually under a minute. You can also add the book to your Telegram library.</li>
+      </ol>
+    </section>
+  </main>
+
+  <dialog id="checkout" class="checkout" aria-labelledby="co-title">
+    <form method="dialog" class="co-close-row"><button class="icon-btn" aria-label="Close">✕</button></form>
+    <h2 id="co-title">Checkout</h2>
+    <p id="co-book" class="co-book"></p>
+    <div class="co-amount"><span id="co-ton"></span> <span class="unit">TON</span></div>
+    <ol class="co-steps">
+      <li id="st-connect">Connect wallet</li>
+      <li id="st-confirm">Confirm in wallet</li>
+      <li id="st-wait">Payment received</li>
+    </ol>
+    <p id="co-msg" class="co-msg" role="status"></p>
+    <div id="co-actions" class="co-actions"></div>
+    <details id="co-manual" class="co-manual" hidden>
+      <summary>Paying from an exchange or another app?</summary>
+      <p>Send exactly <strong id="mn-amount"></strong> TON to <code id="mn-address"></code> with the comment <code id="mn-comment"></code>. The comment is required; without it we cannot match your payment.</p>
+    </details>
+    <p class="co-order muted">Order <code id="co-id"></code></p>
+  </dialog>
+
+  <footer class="wrap foot muted">
+    <p>Questions or payment trouble? Message <a id="bot-link" href="#">our Telegram bot</a> and use /paysupport.</p>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

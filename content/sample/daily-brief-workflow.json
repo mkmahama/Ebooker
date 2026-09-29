@@ -1,0 +1,199 @@
+{
+  "name": "AI Daily Brief to Telegram (Drop Shelf starter)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## AI daily brief\nEvery morning: read your feeds, summarize with AI, send to Telegram.\n\n1. Set your feed URL in **Read feed**.\n2. Add OpenAI credentials to **Chat model**.\n3. Add Telegram credentials and your chat id to **Send brief**.\n\nStarter file from Drop Shelf. Test it before relying on it.",
+        "height": 300,
+        "width": 360
+      },
+      "id": "b1d1a0e0-0000-4000-8000-000000000001",
+      "name": "Read me",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -420,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "triggerAtHour": 7,
+              "triggerAtMinute": 30
+            }
+          ]
+        }
+      },
+      "id": "b1d1a0e0-0000-4000-8000-000000000002",
+      "name": "Every morning",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://hnrss.org/frontpage",
+        "options": {}
+      },
+      "id": "b1d1a0e0-0000-4000-8000-000000000003",
+      "name": "Read feed",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.1,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "maxItems": 10
+      },
+      "id": "b1d1a0e0-0000-4000-8000-000000000004",
+      "name": "Top 10",
+      "type": "n8n-nodes-base.limit",
+      "typeVersion": 1,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "options": {}
+      },
+      "id": "b1d1a0e0-0000-4000-8000-000000000005",
+      "name": "Combine items",
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Write a short morning brief (max 8 bullets, one line each, plain text) from these headlines. Group related items and say why each matters.\n\n{{ $json.data.map(i => '- ' + i.title + ' (' + i.link + ')').join('\\n') }}"
+      },
+      "id": "b1d1a0e0-0000-4000-8000-000000000006",
+      "name": "Summarize",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.4,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {}
+      },
+      "id": "b1d1a0e0-0000-4000-8000-000000000007",
+      "name": "Chat model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [
+        880,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ \"☀️ Your brief\\n\\n\" + $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "b1d1a0e0-0000-4000-8000-000000000008",
+      "name": "Send brief",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1120,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Every morning": {
+      "main": [
+        [
+          {
+            "node": "Read feed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read feed": {
+      "main": [
+        [
+          {
+            "node": "Top 10",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Top 10": {
+      "main": [
+        [
+          {
+            "node": "Combine items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Combine items": {
+      "main": [
+        [
+          {
+            "node": "Summarize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chat model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Summarize",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarize": {
+      "main": [
+        [
+          {
+            "node": "Send brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
