@@ -1,91 +1,95 @@
-// Polls the receiving wallet (toncenter v2 getTransactions) and marks TON orders paid when an
-// incoming transfer carries the order id as its comment and at least the order amount.
-export class TonWatcher {
-  constructor({ store, config, fetchImpl = globalThis.fetch, log = console, onPaid = () => {} }) {
-    this.store = store;
-    this.cfg = config.ton;
-    this.fetch = fetchImpl;
-    this.log = log;
-    this.onPaid = onPaid;
-    this.timer = null;
-  }
+/**
+ * Watches the receiving wallet through toncenter's v2 HTTP API and settles
+ * orders whose transfer comment equals the order id and whose amount covers the price.
+ */
+const ORDER_RE = /^DS-[A-Z0-9]{8}$/;
 
-  async fetchTransactions(limit = 50) {
-    const url = new URL(`${this.cfg.apiBase}/getTransactions`);
-    url.searchParams.set('address', this.cfg.wallet);
-    url.searchParams.set('limit', String(limit));
-    url.searchParams.set('archival', 'true');
-    const headers = this.cfg.apiKey ? { 'X-API-Key': this.cfg.apiKey } : {};
-    const res = await this.fetch(url, { headers });
+export function toncenterBase(network) {
+  return network === 'mainnet' ? 'https://toncenter.com/api/v2' : 'https://testnet.toncenter.com/api/v2';
+}
+
+/** Extract the text comment from a toncenter v2 in_msg. */
+export function inMsgComment(inMsg) {
+  if (!inMsg) return '';
+  if (typeof inMsg.message === 'string' && inMsg.message) return inMsg.message;
+  const d = inMsg.msg_data;
+  if (d && d['@type'] === 'msg.dataText' && d.text) {
+    try { return Buffer.from(d.text, 'base64').toString('utf8'); } catch { return ''; }
+  }
+  return '';
+}
+
+export function createWatcher({ db, cfg, fetchImpl = fetch, log = console, onEvent = async () => {} }) {
+  const base = toncenterBase(cfg.tonNetwork);
+  const headers = cfg.toncenterApiKey ? { 'X-API-Key': cfg.toncenterApiKey } : {};
+
+  async function getTransactions({ lt, hash } = {}) {
+    const params = new URLSearchParams({ address: cfg.tonReceiver, limit: '50', archival: 'true' });
+    if (lt && hash) { params.set('lt', lt); params.set('hash', hash); }
+    const res = await fetchImpl(`${base}/getTransactions?${params}`, { headers });
+    if (!res.ok) throw new Error(`toncenter HTTP ${res.status}`);
     const body = await res.json();
-    if (!body.ok) throw new Error(`toncenter: ${body.error || res.status}`);
-    return body.result;
+    if (!body.ok) throw new Error(`toncenter error: ${body.error}`);
+    return body.result || [];
   }
 
-  /** Processes one batch of transactions; returns the orders that became paid. */
-  processTransactions(txs) {
-    const paid = [];
-    for (const t of txs) {
-      const hash = t.transaction_id?.hash;
-      const lt = t.transaction_id?.lt;
-      const msg = t.in_msg;
-      if (!hash || this.store.hasSeenTx(hash)) continue;
-      if (!msg || !msg.source) continue; // external/outgoing only — nothing to match, and not yet final to mark
-      const comment = (msg.message || '').trim();
-      const value = BigInt(msg.value || '0');
-      const order = /^DS-[A-Z0-9]{10}$/.test(comment) ? this.store.getTonOrder(comment) : null;
-
-      if (!order) {
-        this.store.markTxSeen(hash, lt, null, comment ? 'no matching order' : 'no comment');
-        continue;
+  /** Newest-first pages until a seen transaction (or maxPages). Returns oldest-first unseen txs. */
+  async function fetchUnseen(maxPages = 5) {
+    const out = [];
+    let cursor;
+    for (let page = 0; page < maxPages; page++) {
+      const txs = await getTransactions(cursor);
+      let reachedSeen = false;
+      for (const tx of txs) {
+        if (cursor && tx.transaction_id.hash === cursor.hash) continue; // the cursor tx repeats on the next page
+        if (db.isTxSeen(tx.transaction_id.hash)) { reachedSeen = true; break; }
+        out.push(tx);
       }
-      if (order.status === 'paid' || order.status === 'refunded') {
-        this.store.markTxSeen(hash, lt, order.id, 'duplicate payment for settled order');
-        this.log.warn?.(`[ton] duplicate transfer ${hash} for ${order.id}; refund manually if needed`);
-        continue;
-      }
-      if (value < BigInt(order.amount_nano)) {
-        this.store.markTxSeen(hash, lt, order.id, `underpaid ${value}`);
-        this.log.warn?.(`[ton] underpaid transfer ${hash} for ${order.id}: ${value} < ${order.amount_nano}`);
-        continue;
-      }
-      if (this.store.markTonOrderPaid(order.id, { txHash: hash, sender: msg.source, paidNano: value })) {
-        paid.push(this.store.getTonOrder(order.id));
-      }
-      this.store.markTxSeen(hash, lt, order.id, 'paid');
+      if (reachedSeen || txs.length < 50) break;
+      const last = txs[txs.length - 1].transaction_id;
+      cursor = { lt: last.lt, hash: last.hash };
     }
-    return paid;
+    return out.reverse();
   }
 
-  async tick() {
-    this.store.expireTonOrders();
-    const txs = await this.fetchTransactions();
-    // Oldest first, so a duplicate payment never settles an order ahead of the original.
-    const paid = this.processTransactions([...txs].reverse());
-    for (const order of paid) {
-      this.log.info?.(`[ton] order ${order.id} paid by ${order.sender} (${order.tx_hash})`);
-      await this.onPaid(order);
+  async function pollOnce() {
+    const expired = db.expireOrders();
+    if (expired) log.info?.(`watcher: ${expired} order(s) expired`);
+    if (!db.openOrderIds().length) return { processed: 0, settled: [] };
+
+    const txs = await fetchUnseen();
+    const settled = [];
+    for (const tx of txs) {
+      const { hash, lt } = tx.transaction_id;
+      const inMsg = tx.in_msg;
+      const comment = inMsgComment(inMsg).trim().toUpperCase();
+      if (!inMsg?.source || !ORDER_RE.test(comment)) { db.markTxSeen(hash, lt); continue; }
+      const order = db.getTonOrder(comment);
+      if (!order) { db.markTxSeen(hash, lt); await onEvent({ type: 'unknown_order', comment, hash, value: inMsg.value }); continue; }
+      if (order.status === 'paid' || order.status === 'underpaid') {
+        db.markTxSeen(hash, lt);
+        await onEvent({ type: 'extra_payment', order, hash, value: inMsg.value });
+        continue;
+      }
+      const r = db.settleTonOrder({ orderId: order.id, txHash: hash, receivedNano: inMsg.value, lt });
+      if (r.changed) {
+        settled.push(r.order);
+        await onEvent({ type: r.order.status, order: r.order, hash, value: inMsg.value });
+      }
     }
-    return paid;
+    return { processed: txs.length, settled };
   }
 
-  start() {
-    if (!this.cfg.wallet) {
-      this.log.warn?.('[ton] TON_WALLET_ADDRESS not set; watcher disabled');
-      return;
-    }
-    const loop = async () => {
-      try {
-        await this.tick();
-      } catch (err) {
-        this.log.error?.(`[ton] watcher error: ${err.message}`);
-      }
-      this.timer = setTimeout(loop, this.cfg.pollSeconds * 1000);
+  let timer = null;
+  function start() {
+    const tick = async () => {
+      try { await pollOnce(); } catch (e) { log.error?.(`watcher: ${e.message}`); }
+      timer = setTimeout(tick, cfg.watchIntervalSeconds * 1000);
     };
-    loop();
+    tick();
+    log.info?.(`watcher: polling ${cfg.tonNetwork} wallet every ${cfg.watchIntervalSeconds}s`);
   }
+  function stop() { if (timer) clearTimeout(timer); timer = null; }
 
-  stop() {
-    clearTimeout(this.timer);
-  }
+  return { pollOnce, start, stop, fetchUnseen };
 }

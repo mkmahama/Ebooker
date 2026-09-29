@@ -1,306 +1,371 @@
-import { test } from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
-import { makeApp, user, textUpdate, callbackUpdate, buyWithStars } from './helpers.js';
-import { COMMANDS } from '../src/bot/bot.js';
+import { createBot, COMMANDS, parseStartPayload, decodeInvoicePayload, encodeInvoicePayload, REFUND_POLICY } from '../src/bot/bot.js';
+import { makeCfg, makeDb, fakeApi, silentLog, msgUpdate, cbUpdate, preCheckoutUpdate, paidUpdate } from './helpers.js';
 
-const buttons = (call) => call.params.reply_markup.inline_keyboard.flat();
+function setup(over = {}) {
+  const cfg = makeCfg(over);
+  const db = makeDb();
+  const api = fakeApi();
+  const bot = createBot({ db, api, cfg, log: silentLog });
+  return { cfg, db, api, bot };
+}
+const alice = { id: 1001, first_name: 'Alice', username: 'alice' };
+const bob = { id: 1002, first_name: 'Bob' };
+const buttons = (call) => (call.params.reply_markup?.inline_keyboard || []).flat();
 
-test('exactly the seven specified commands are registered', () => {
-  assert.deepEqual(COMMANDS.map((c) => c.command), ['start', 'shelf', 'sample', 'library', 'invite', 'help', 'paysupport']);
+/** Buy flow helper: invoice -> pre-checkout -> successful_payment. Returns the invoice. */
+async function buy(ctx, user, bookId, charge) {
+  await ctx.bot.handleUpdate(cbUpdate(user, `buy:${bookId}`));
+  const inv = ctx.api.of('sendInvoice').at(-1).params;
+  await ctx.bot.handleUpdate(preCheckoutUpdate(user, { payload: inv.payload, amount: inv.prices[0].amount }));
+  await ctx.bot.handleUpdate(paidUpdate(user, { payload: inv.payload, amount: inv.prices[0].amount, charge }));
+  return inv;
+}
+
+test('registers exactly the seven commands', async () => {
+  const { bot, api } = setup();
+  await bot.registerCommands();
+  const names = api.of('setMyCommands')[0].params.commands.map((c) => c.command);
+  assert.deepEqual(names, ['start', 'shelf', 'sample', 'library', 'invite', 'help', 'paysupport']);
+  assert.equal(COMMANDS.length, 7);
 });
 
-test('/start welcomes with the three main buttons and creates the user', async () => {
-  const app = await makeApp();
-  const u = user(1);
-  await app.bot.handleUpdate(textUpdate(u, '/start'));
-  const welcome = app.api.of('sendMessage')[0];
-  assert.deepEqual(buttons(welcome).map((b) => b.text), ['📖 Get a free chapter', '📚 Browse the shelf', '🗂 My library']);
-  const profile = app.store.getUserProfile(1);
-  assert.equal(profile.telegram_user_id, 1);
-  assert.match(profile.referral_code, /^[A-Z2-9]{8}$/);
-  assert.equal(profile.alert_opt_in, false);
-  assert.deepEqual(profile.purchases, []);
+test('/start shows the three main buttons', async () => {
+  const { bot, api, db } = setup();
+  await bot.handleUpdate(msgUpdate(alice, '/start'));
+  const labels = buttons(api.of('sendMessage')[0]).map((b) => b.text);
+  assert.deepEqual(labels, ['🎁 Get a free chapter', '📚 Browse the shelf', '🗂 My library']);
+  assert.ok(db.getUser(alice.id));
 });
 
-test('/start deep links: sample, buy_<slug>, ref_<code> are handled and logged', async () => {
-  const app = await makeApp();
-  await app.bot.handleUpdate(textUpdate(user(1), '/start'));
-  const code = app.store.getUser(1).referral_code;
-
-  await app.bot.handleUpdate(textUpdate(user(2), `/start ref_${code}`));
-  assert.equal(app.store.getUser(2).referrer_id, 1);
-
-  // Existing users can't be re-attributed, and self-referral is ignored.
-  await app.bot.handleUpdate(textUpdate(user(2), '/start ref_XXXXXXXX'));
-  assert.equal(app.store.getUser(2).referrer_id, 1);
-  await app.bot.handleUpdate(textUpdate(user(3), `/start ref_${app.store.getUser(3)?.referral_code || 'NONE'}`));
-  assert.equal(app.store.getUser(3).referrer_id, null);
-
-  await app.bot.handleUpdate(textUpdate(user(4), '/start buy_ai-control-center'));
-  assert.equal(app.api.of('sendInvoice').at(-1).params.chat_id, 4);
-
-  await app.bot.handleUpdate(textUpdate(user(5), '/start sample_channel'));
-  assert.equal(app.store.getUser(5).alert_opt_in, 1);
-  const events = app.db.prepare("SELECT data FROM events WHERE type = 'start'").all().map((r) => JSON.parse(r.data).payload);
-  assert.ok(events.includes('sample_channel') && events.includes('buy_ai-control-center'));
+test('deep-link payload parsing', () => {
+  assert.deepEqual(parseStartPayload('sample'), { kind: 'sample' });
+  assert.deepEqual(parseStartPayload('sample_ai-control-center'), { kind: 'sample', bookId: 'ai-control-center' });
+  assert.deepEqual(parseStartPayload('buy_first-ai-workflow'), { kind: 'buy', bookId: 'first-ai-workflow' });
+  assert.deepEqual(parseStartPayload('ref_ABCD2345'), { kind: 'ref', code: 'ABCD2345' });
+  assert.deepEqual(parseStartPayload('claim_ABCDEFGH2345'), { kind: 'claim', code: 'ABCDEFGH2345' });
+  assert.equal(parseStartPayload('../etc').kind, 'unknown');
+  assert.equal(parseStartPayload('').kind, 'none');
 });
 
-test('/shelf lists active books, current drop first, with Buy and Free chapter buttons', async () => {
-  const app = await makeApp();
-  await app.bot.handleUpdate(textUpdate(user(1), '/shelf'));
-  const items = app.api.of('sendMessage');
-  assert.equal(items.length, 4);
-  assert.match(items[0].params.text, /Current drop[\s\S]*Telegram as Your AI Control Center/);
-  assert.match(items[0].params.text, /300 Stars<\/b> launch price/);
-  assert.deepEqual(buttons(items[0]).map((b) => b.text), ['⭐ Buy · 300 Stars', '📖 Free chapter']);
-  assert.match(items[1].params.text, /Automate Your Telegram Channel/);
-  assert.match(items[2].params.text, /Zapier vs Make vs n8n/);
-  assert.match(items[3].params.text, /Bundle/);
-
-  app.store.setBookField('automate-channel-ai', 'active', 0);
-  app.api.reset();
-  await app.bot.handleUpdate(textUpdate(user(1), '/shelf'));
-  assert.equal(app.api.of('sendMessage').length, 3);
+test('referral code attaches only to new users and never to yourself', async () => {
+  const { bot, db } = setup();
+  await bot.handleUpdate(msgUpdate(alice, '/start'));
+  const code = db.getUser(alice.id).referral_code;
+  await bot.handleUpdate(msgUpdate(alice, `/start ref_${code}`)); // self
+  assert.equal(db.getUser(alice.id).referrer_id, null);
+  await bot.handleUpdate(msgUpdate(bob, `/start ref_${code}`)); // new user
+  assert.equal(db.getUser(bob.id).referrer_id, alice.id);
+  assert.equal(db.getUser(bob.id).first_source, `ref_${code}`);
+  const carol = { id: 1003, first_name: 'Carol' };
+  await bot.handleUpdate(msgUpdate(carol, '/start'));
+  await bot.handleUpdate(msgUpdate(carol, `/start ref_${code}`)); // existing user
+  assert.equal(db.getUser(carol.id).referrer_id, null);
 });
 
-test('/shelf uses the cover image when one exists', async () => {
-  const app = await makeApp();
-  const { writeFileSync } = await import('node:fs');
-  writeFileSync(`${app.config.storageDir}/covers/ai-control-center.jpg`, Buffer.from([0xff, 0xd8, 0xff]));
-  await app.bot.handleUpdate(textUpdate(user(1), '/shelf'));
-  const photo = app.api.of('sendPhoto')[0];
-  assert.match(photo.params.caption, /AI Control Center/);
-  assert.equal(buttons(photo)[0].callback_data, `buy:${app.store.getBookBySlug('ai-control-center').id}`);
-});
-
-test('/sample delivers the guide PDF and workflow JSON, and opts into drop alerts', async () => {
-  const app = await makeApp();
-  await app.bot.handleUpdate(textUpdate(user(1), '/sample'));
-  const docs = app.api.of('sendDocument').map((c) => c.params.document.filename);
-  assert.deepEqual(docs, ['ai-daily-brief.pdf', 'ai-daily-brief.workflow.json']);
-  assert.equal(app.store.getUser(1).alert_opt_in, 1);
-  const outro = app.api.of('sendMessage').at(-1);
-  assert.match(buttons(outro)[0].text, /Buy the full book/);
-
-  // Second time: cached file_ids are reused instead of re-uploading.
-  app.api.reset();
-  await app.bot.handleUpdate(textUpdate(user(2), '/sample'));
-  assert.ok(app.api.of('sendDocument').every((c) => typeof c.params.document === 'string'));
-
-  await app.bot.handleUpdate(callbackUpdate(user(1), 'alerts:off'));
-  assert.equal(app.store.getUser(1).alert_opt_in, 0);
-});
-
-test('Stars checkout: XTR invoice, pre-checkout validation, delivery only after successful_payment', async () => {
-  const app = await makeApp();
-  const u = user(10);
-  const book = app.store.getBookBySlug('ai-control-center');
-  await app.bot.handleUpdate(callbackUpdate(u, `buy:${book.id}`));
-  const inv = app.api.of('sendInvoice')[0].params;
+test('/start buy_<id> deep link sends a Stars invoice', async () => {
+  const { bot, api } = setup();
+  await bot.handleUpdate(msgUpdate(alice, '/start buy_ai-channel-automation'));
+  const inv = api.of('sendInvoice')[0].params;
   assert.equal(inv.currency, 'XTR');
-  assert.equal(inv.provider_token, '');
-  assert.deepEqual(inv.prices, [{ label: 'Telegram AI Control Center', amount: 300 }]);
-  assert.ok(inv.title.length <= 32);
-  assert.equal(app.api.of('sendDocument').length, 0, 'nothing delivered before payment');
+  assert.equal(inv.prices[0].amount, 300);
+  assert.equal(inv.provider_token, undefined);
+});
 
-  const pcq = (over) => app.bot.handleUpdate({ pre_checkout_query: { id: 'q', from: u, currency: 'XTR', total_amount: 300, invoice_payload: inv.payload, ...over } });
-  await pcq({ total_amount: 1 });
-  assert.equal(app.api.of('answerPreCheckoutQuery').at(-1).params.ok, false);
-  await pcq({ from: user(11) });
-  assert.equal(app.api.of('answerPreCheckoutQuery').at(-1).params.ok, false);
-  await pcq({ currency: 'USD' });
-  assert.equal(app.api.of('answerPreCheckoutQuery').at(-1).params.ok, false);
-  await pcq({});
-  assert.equal(app.api.of('answerPreCheckoutQuery').at(-1).params.ok, true);
-  assert.equal(app.api.of('sendDocument').length, 0, 'still nothing delivered after pre-checkout');
+test('/shelf lists live books, current drop first, with Buy and Free chapter', async () => {
+  const { bot, api, db } = setup();
+  db.startLaunch('ai-control-center', 48);
+  await bot.handleUpdate(msgUpdate(alice, '/shelf'));
+  const msgs = api.of('sendMessage');
+  assert.equal(msgs.length, 3);
+  assert.match(msgs[0].params.text, /Current drop/);
+  assert.match(msgs[0].params.text, /Telegram as Your AI Control Center/);
+  assert.match(msgs[0].params.text, /300 Stars<\/b> launch price, 48h left \(then 450\)/);
+  const labels = buttons(msgs[0]).map((b) => b.text);
+  assert.deepEqual(labels, ['Buy · 300 ⭐', '🎁 Free chapter']);
+});
 
-  const pay = { message: { message_id: 5, from: u, chat: { id: 10, type: 'private' }, successful_payment: { currency: 'XTR', total_amount: 300, invoice_payload: inv.payload, telegram_payment_charge_id: 'stxABC', provider_payment_charge_id: '' } } };
-  await app.bot.handleUpdate(pay);
-  const docs = app.api.of('sendDocument');
+test('invoices use XTR, titles fit the 32-char limit, launch vs full price', async () => {
+  const { bot, api, db } = setup();
+  for (const id of ['ai-control-center', 'ai-channel-automation', 'first-ai-workflow']) {
+    await bot.handleUpdate(cbUpdate(alice, `buy:${id}`));
+  }
+  const invs = api.of('sendInvoice').map((c) => c.params);
+  assert.deepEqual(invs.map((i) => i.prices[0].amount), [450, 300, 150]);
+  for (const i of invs) {
+    assert.equal(i.currency, 'XTR');
+    assert.ok(i.title.length <= 32 && i.description.length <= 255 && Buffer.byteLength(i.payload) <= 128);
+  }
+  db.startLaunch('ai-control-center', 48);
+  await bot.handleUpdate(cbUpdate(alice, 'buy:ai-control-center'));
+  assert.equal(api.of('sendInvoice').at(-1).params.prices[0].amount, 300);
+});
+
+test('pre_checkout_query: accepts valid, rejects tampered, owned and stale invoices', async () => {
+  const ctx = setup();
+  const { bot, api, db } = ctx;
+  const answer = () => api.of('answerPreCheckoutQuery').at(-1).params;
+
+  await bot.handleUpdate(cbUpdate(alice, 'buy:ai-control-center'));
+  const inv = api.of('sendInvoice').at(-1).params;
+  await bot.handleUpdate(preCheckoutUpdate(alice, { payload: inv.payload, amount: 450 }));
+  assert.equal(answer().ok, true);
+
+  await bot.handleUpdate(preCheckoutUpdate(alice, { payload: inv.payload, amount: 1 }));
+  assert.equal(answer().ok, false);
+  await bot.handleUpdate(preCheckoutUpdate(alice, { payload: inv.payload, amount: 450, currency: 'USD' }));
+  assert.equal(answer().ok, false);
+  await bot.handleUpdate(preCheckoutUpdate(alice, { payload: 'garbage', amount: 450 }));
+  assert.equal(answer().ok, false);
+  await bot.handleUpdate(preCheckoutUpdate(alice, { payload: encodeInvoicePayload('nope', 450), amount: 450 }));
+  assert.equal(answer().ok, false);
+
+  // launch-price invoice paid after the launch ended: honored within the grace hour, refused later
+  const now = Math.floor(Date.now() / 1000);
+  await bot.handleUpdate(preCheckoutUpdate(alice, { payload: encodeInvoicePayload('ai-control-center', 300, now - 600), amount: 300 }));
+  assert.equal(answer().ok, true);
+  await bot.handleUpdate(preCheckoutUpdate(alice, { payload: encodeInvoicePayload('ai-control-center', 300, now - 7200), amount: 300 }));
+  assert.equal(answer().ok, false);
+  assert.match(answer().error_message, /price has changed/);
+
+  await buy(ctx, alice, 'first-ai-workflow', 'ch_owned');
+  await bot.handleUpdate(preCheckoutUpdate(alice, { payload: encodeInvoicePayload('first-ai-workflow', 150), amount: 150 }));
+  assert.equal(answer().ok, false);
+  assert.match(answer().error_message, /already own/);
+
+  db.setBookStatus('ai-channel-automation', 'hidden');
+  await bot.handleUpdate(preCheckoutUpdate(alice, { payload: encodeInvoicePayload('ai-channel-automation', 300), amount: 300 }));
+  assert.equal(answer().ok, false);
+});
+
+test('files are delivered only after successful_payment; charge_id stored; retries are idempotent', async () => {
+  const ctx = setup();
+  const { bot, api, db } = ctx;
+  await bot.handleUpdate(cbUpdate(alice, 'buy:ai-control-center'));
+  const inv = api.of('sendInvoice')[0].params;
+  await bot.handleUpdate(preCheckoutUpdate(alice, { payload: inv.payload, amount: 450 }));
+  assert.equal(api.of('sendDocument').length, 0, 'nothing delivered before payment');
+
+  const paid = paidUpdate(alice, { payload: inv.payload, amount: 450, charge: 'ch_abc' });
+  await bot.handleUpdate(paid);
+  const docs = api.of('sendDocument');
   assert.equal(docs.length, 2);
-  assert.equal(docs[1].params.document.filename, 'ai-control-center.pdf');
-  assert.ok(Buffer.isBuffer(docs[1].params.document.buffer), 'PDF is stamped per buyer');
-  assert.ok(app.api.texts(10).some((t) => t.includes('Receipt') && t.includes('stxABC')));
+  assert.deepEqual(docs.map((d) => d.params.document.filename), ['Telegram-as-Your-AI-Control-Center.epub', 'Telegram-as-Your-AI-Control-Center.pdf']);
 
-  const profile = app.store.getUserProfile(10);
-  assert.equal(profile.purchases.length, 1);
-  assert.equal(profile.purchases[0].charge_id, 'stxABC');
-  assert.equal(profile.purchases[0].stars_paid, 300);
-  assert.equal(profile.purchases[0].method, 'stars');
+  const u = db.getUserWithPurchases(alice.id);
+  assert.equal(u.purchases.length, 1);
+  assert.equal(u.purchases[0].charge_id, 'ch_abc');
+  assert.equal(u.purchases[0].stars_paid, 450);
+  assert.equal(u.purchases[0].book_id, 'ai-control-center');
+  assert.ok(u.purchases[0].created_at > 0);
 
-  // Duplicate webhook delivery is idempotent.
-  await app.bot.handleUpdate(pay);
-  assert.equal(app.api.of('sendDocument').length, 2);
-  assert.equal(app.store.getUserProfile(10).purchases.length, 1);
-
-  // A second pre-checkout for an owned book is rejected.
-  await app.bot.handleUpdate(callbackUpdate(u, `buy:${book.id}`));
-  assert.ok(app.api.texts(10).at(-1).includes('already in your library'));
+  await bot.handleUpdate(paid); // Telegram redelivers the same update
+  assert.equal(api.of('sendDocument').length, 2);
+  assert.equal(db.listPurchases(alice.id).length, 1);
 });
 
-test('launch window: full price after launch_ends_at', async () => {
-  const app = await makeApp();
-  app.store.setBookField('ai-control-center', 'launch_ends_at', Date.now() - 1000);
-  await app.bot.handleUpdate(callbackUpdate(user(1), `buy:${app.store.getBookBySlug('ai-control-center').id}`));
-  assert.equal(app.api.of('sendInvoice')[0].params.prices[0].amount, 450);
+test('a second paid copy (parallel invoices) is refunded automatically', async () => {
+  const { bot, api, db } = setup();
+  const payload = encodeInvoicePayload('first-ai-workflow', 150);
+  await bot.handleUpdate(paidUpdate(alice, { payload, amount: 150, charge: 'ch_1' }));
+  await bot.handleUpdate(paidUpdate(alice, { payload, amount: 150, charge: 'ch_2' }));
+  const refunds = api.of('refundStarPayment');
+  assert.equal(refunds.length, 1);
+  assert.deepEqual(refunds[0].params, { user_id: alice.id, telegram_payment_charge_id: 'ch_2' });
+  assert.equal(db.listPurchases(alice.id).length, 1);
+  assert.ok(db.getPurchaseByCharge('ch_2').refunded_at);
 });
 
-test('bundle purchase unlocks all three books', async () => {
-  const app = await makeApp();
-  await buyWithStars(app, user(20), 'drop-shelf-bundle');
-  assert.equal(app.api.of('sendInvoice')[0].params.prices[0].amount, 600);
-  assert.equal(app.store.libraryBooks(20).length, 3);
-  assert.equal(app.api.of('sendDocument').length, 6);
+test('uploads once, then re-sends by cached file_id', async () => {
+  const ctx = setup();
+  await buy(ctx, alice, 'first-ai-workflow', 'ch_1');
+  await buy(ctx, bob, 'first-ai-workflow', 'ch_2');
+  const docs = ctx.api.of('sendDocument').map((d) => d.params.document);
+  assert.equal(typeof docs[0], 'object');
+  assert.equal(typeof docs[2], 'string');
+  assert.match(docs[2], /^FILE_/);
 });
 
-test('/library lists purchases with EPUB and PDF buttons; re-download checks ownership', async () => {
-  const app = await makeApp();
-  const u = user(30);
-  await app.bot.handleUpdate(textUpdate(u, '/library'));
-  assert.match(app.api.texts(30).at(-1), /library is empty/);
+test('/library lists owned books; downloads require ownership', async () => {
+  const ctx = setup();
+  const { bot, api } = ctx;
+  await bot.handleUpdate(msgUpdate(alice, '/library'));
+  assert.match(api.of('sendMessage').at(-1).params.text, /empty/);
 
-  await buyWithStars(app, u, 'first-ai-workflow-weekend');
-  app.api.reset();
-  await app.bot.handleUpdate(textUpdate(u, '/library'));
-  const lib = app.api.of('sendMessage')[0];
-  const id = app.store.getBookBySlug('first-ai-workflow-weekend').id;
-  assert.deepEqual(buttons(lib).map((b) => b.callback_data), [`dl:${id}:epub`, `dl:${id}:pdf`]);
+  await buy(ctx, alice, 'ai-channel-automation', 'ch_x');
+  api.clear();
+  await bot.handleUpdate(msgUpdate(alice, '/library'));
+  const lib = api.of('sendMessage')[0];
+  assert.deepEqual(buttons(lib).map((b) => b.callback_data), ['dl:ai-channel-automation:epub', 'dl:ai-channel-automation:pdf']);
 
-  app.api.reset();
-  await app.bot.handleUpdate(callbackUpdate(u, `dl:${id}:epub`));
-  assert.equal(app.api.of('sendDocument').length, 1);
-
-  const other = app.store.getBookBySlug('ai-control-center').id;
-  app.api.reset();
-  await app.bot.handleUpdate(callbackUpdate(u, `dl:${other}:pdf`));
-  assert.equal(app.api.of('sendDocument').length, 0);
-  assert.equal(app.api.of('answerCallbackQuery')[0].params.show_alert, true);
+  api.clear();
+  await bot.handleUpdate(cbUpdate(alice, 'dl:ai-channel-automation:pdf'));
+  assert.equal(api.of('sendDocument').length, 1);
+  await bot.handleUpdate(cbUpdate(bob, 'dl:ai-channel-automation:pdf'));
+  assert.equal(api.of('sendDocument').length, 1, 'bob does not own it');
+  assert.match(api.of('answerCallbackQuery').at(-1).params.text, /not in your library/);
+  await bot.handleUpdate(cbUpdate(alice, 'dl:ai-channel-automation:exe'));
+  assert.equal(api.of('sendDocument').length, 1);
 });
 
-test('/invite shows the link and progress; 3 referred buyers unlock the free book once', async () => {
-  const app = await makeApp();
-  const referrer = user(40);
-  await app.bot.handleUpdate(textUpdate(referrer, '/start'));
-  const code = app.store.getUser(40).referral_code;
+test('/sample sends the chapter + workflow JSON and opts into drop alerts', async () => {
+  const { bot, api, db } = setup();
+  await bot.handleUpdate(msgUpdate(alice, '/sample'));
+  const files = api.of('sendDocument').map((d) => d.params.document.filename);
+  assert.deepEqual(files, ['daily-brief-chapter.pdf', 'daily-brief-workflow.json']);
+  assert.equal(db.getUserWithPurchases(alice.id).alert_opt_in, true);
+  await bot.handleUpdate(cbUpdate(alice, 'alerts:off'));
+  assert.equal(db.getUserWithPurchases(alice.id).alert_opt_in, false);
+});
 
-  for (const id of [41, 42]) {
-    await app.bot.handleUpdate(textUpdate(user(id), `/start ref_${code}`));
-    await buyWithStars(app, user(id), 'automate-channel-ai');
+test('/invite shows the link and progress; 3 buying referrals earn the reward book', async () => {
+  const ctx = setup();
+  const { bot, api, db } = ctx;
+  await bot.handleUpdate(msgUpdate(alice, '/invite'));
+  const code = db.getUser(alice.id).referral_code;
+  const inviteText = api.of('sendMessage').at(-1).params.text;
+  assert.ok(inviteText.includes(`https://t.me/YourShelfBot?start=ref_${code}`));
+  assert.match(inviteText, /0 of 3<\/b> referrals to your free book/);
+
+  const friends = [2001, 2002, 2003].map((id) => ({ id, first_name: `F${id}` }));
+  for (const f of friends) await bot.handleUpdate(msgUpdate(f, `/start ref_${code}`));
+  await buy(ctx, friends[0], 'ai-control-center', 'r1');
+  await buy(ctx, friends[1], 'ai-control-center', 'r2');
+  api.clear();
+  await bot.handleUpdate(msgUpdate(alice, '/invite'));
+  assert.match(api.of('sendMessage').at(-1).params.text, /2 of 3<\/b>/);
+
+  api.clear();
+  await buy(ctx, friends[2], 'first-ai-workflow', 'r3');
+  assert.ok(db.ownsBook(alice.id, 'first-ai-workflow'), 'reward granted');
+  const toAlice = api.calls.filter((c) => c.params.chat_id === alice.id);
+  assert.ok(toAlice.some((c) => c.method === 'sendDocument'), 'reward delivered');
+  assert.equal(db.getUser(alice.id).referral_rewarded, 1);
+
+  // a fourth referral does not grant again
+  const f4 = { id: 2004 };
+  await bot.handleUpdate(msgUpdate(f4, `/start ref_${code}`));
+  await buy(ctx, f4, 'first-ai-workflow', 'r4');
+  assert.equal(db.listPurchases(alice.id).length, 1);
+});
+
+test('/help has FAQ, refund policy, contact button, and never mentions TON', async () => {
+  const { bot, api } = setup();
+  await bot.handleUpdate(msgUpdate(alice, '/help'));
+  const m = api.of('sendMessage')[0];
+  assert.ok(m.params.text.includes(REFUND_POLICY));
+  const b = buttons(m);
+  assert.equal(b[0].url, 'https://t.me/ShelfSupport');
+  assert.ok(b.some((x) => x.callback_data === 'ticket:open'));
+});
+
+test('no TON checkout or TON links anywhere in the bot', async () => {
+  const ctx = setup();
+  const { bot, api, db } = ctx;
+  db.startLaunch('ai-control-center', 48);
+  for (const t of ['/start', '/shelf', '/sample', '/library', '/invite', '/help', '/paysupport', 'hello']) {
+    await bot.handleUpdate(msgUpdate(alice, t));
   }
-  app.api.reset();
-  await app.bot.handleUpdate(textUpdate(referrer, '/invite'));
-  const invite = app.api.texts(40)[0];
-  assert.match(invite, /https:\/\/t\.me\/YourShelfBot\?start=ref_/);
-  assert.match(invite, /<b>2 of 3<\/b> referrals to your free book/);
-
-  // A referred user who only starts (no purchase) does not count.
-  await app.bot.handleUpdate(textUpdate(user(43), `/start ref_${code}`));
-  assert.equal(app.store.qualifiedReferralCount(40), 2);
-
-  await app.bot.handleUpdate(textUpdate(user(44), `/start ref_${code}`));
-  await buyWithStars(app, user(44), 'ai-control-center');
-  const reward = app.store.getBookBySlug('first-ai-workflow-weekend');
-  assert.ok(app.store.ownedBookIds(40).has(reward.id));
-  assert.ok(app.api.texts(40).some((t) => t.includes('You unlocked a free book')));
-
-  // Fourth referral does not grant again.
-  await app.bot.handleUpdate(textUpdate(user(45), `/start ref_${code}`));
-  await buyWithStars(app, user(45), 'ai-control-center');
-  assert.equal(app.store.getUserProfile(40).purchases.filter((p) => p.method === 'referral').length, 1);
+  await buy(ctx, alice, 'ai-control-center', 'c1');
+  const everything = JSON.stringify(api.calls.filter((c) => c.params.chat_id === alice.id));
+  assert.doesNotMatch(everything, /\bTON\b|toncoin|tonkeeper|ton connect/i);
+  assert.ok(!everything.includes('shop.test'), 'no link to the web checkout');
 });
 
-test('/help shows FAQ, refund policy and a contact button', async () => {
-  const app = await makeApp({ SUPPORT_CONTACT_URL: 'https://t.me/dropshelf_support' });
-  await app.bot.handleUpdate(textUpdate(user(1), '/help'));
-  const help = app.api.of('sendMessage')[0];
-  assert.match(help.params.text, /Refund policy/);
-  assert.equal(buttons(help)[0].url, 'https://t.me/dropshelf_support');
+test('/paysupport opens a thread relayed both ways and closes', async () => {
+  const ctx = setup();
+  const { bot, api, db, cfg } = ctx;
+  await buy(ctx, alice, 'first-ai-workflow', 'ch_help');
+  api.clear();
+  await bot.handleUpdate(msgUpdate(alice, '/paysupport'));
+  const [header, userMsg] = api.of('sendMessage');
+  assert.equal(header.params.chat_id, cfg.supportChatId);
+  assert.match(header.params.text, /Ticket #1/);
+  assert.match(header.params.text, /ch_help/);
+  assert.match(userMsg.params.text, /ticket #1/);
+
+  await bot.handleUpdate(msgUpdate(alice, '/paysupport')); // reuses the open ticket
+  assert.equal(db.raw.prepare('SELECT COUNT(*) n FROM support_tickets').get().n, 1);
+
+  api.clear();
+  await bot.handleUpdate(msgUpdate(alice, 'I paid but got nothing'));
+  const relayed = api.of('sendMessage')[0];
+  assert.equal(relayed.params.chat_id, cfg.supportChatId);
+  assert.match(relayed.params.text, /#1 · Alice:\nI paid but got nothing/);
+
+  // admin replies to the relayed message in the support chat
+  const admin = { id: 9, first_name: 'Admin' };
+  const relayedId = db.raw.prepare('SELECT support_message_id FROM support_relay ORDER BY rowid DESC LIMIT 1').get().support_message_id;
+  api.clear();
+  await bot.handleUpdate({ update_id: 1, message: { message_id: 5000, from: admin, chat: { id: Number(cfg.supportChatId), type: 'supergroup' }, text: 'Resent your files!', reply_to_message: { message_id: relayedId } } });
+  assert.equal(api.of('sendMessage')[0].params.chat_id, alice.id);
+  assert.match(api.of('sendMessage')[0].params.text, /Resent your files!/);
+
+  api.clear();
+  await bot.handleUpdate({ update_id: 2, message: { message_id: 5001, from: admin, chat: { id: Number(cfg.supportChatId), type: 'supergroup' }, text: '!close', reply_to_message: { message_id: 5000 } } });
+  assert.equal(db.getOpenTicket(alice.id), null);
+  assert.match(api.of('sendMessage')[0].params.text, /closed by our team/);
+
+  api.clear();
+  await bot.handleUpdate(msgUpdate(alice, 'still there?'));
+  assert.notEqual(api.of('sendMessage')[0].params.chat_id, cfg.supportChatId, 'closed ticket no longer relays');
 });
 
-test('/paysupport opens a forum-topic thread and relays messages both ways', async () => {
-  const app = await makeApp({ SUPPORT_USE_TOPICS: 'true' });
-  const u = user(50);
-  await buyWithStars(app, u, 'ai-control-center', 'stxSUPPORT');
-  app.api.reset();
-
-  await app.bot.handleUpdate(textUpdate(u, '/paysupport'));
-  assert.equal(app.api.of('createForumTopic').length, 1);
-  const header = app.api.of('sendMessage').find((c) => c.params.chat_id === '-100500');
+test('/paysupport gives each ticket its own forum topic when the support chat has topics', async () => {
+  const ctx = setup();
+  const { bot, api, db, cfg } = ctx;
+  const call = api.call;
+  api.call = async (method, params) => {
+    const r = await call(method, params);
+    return method === 'createForumTopic' ? { message_thread_id: 77, name: params.name } : r;
+  };
+  await bot.handleUpdate(msgUpdate(alice, '/paysupport'));
+  assert.match(api.of('createForumTopic')[0].params.name, /^#1 · Alice/);
+  const header = api.of('sendMessage')[0];
+  assert.equal(header.params.chat_id, cfg.supportChatId);
   assert.equal(header.params.message_thread_id, 77);
-  assert.match(header.params.text, /stxSUPPORT/);
-  assert.match(app.api.texts(50).at(-1), /ticket #1/);
+  assert.match(header.params.text, /Write in this topic/);
 
-  // User message goes to the topic.
-  await app.bot.handleUpdate(textUpdate(u, 'I paid but the PDF did not arrive'));
-  const copy = app.api.of('copyMessage').at(-1).params;
-  assert.equal(copy.chat_id, '-100500');
-  assert.equal(copy.message_thread_id, 77);
+  api.clear();
+  await bot.handleUpdate(msgUpdate(alice, 'Charged twice'));
+  assert.equal(api.of('sendMessage')[0].params.message_thread_id, 77);
 
-  // Staff reply inside the topic goes back to the user.
-  await app.bot.handleUpdate({ message: { message_id: 9, from: user(999), chat: { id: -100500, type: 'supergroup' }, is_topic_message: true, message_thread_id: 77, text: 'Resent it, check /library' } });
-  assert.match(app.api.texts(50).at(-1), /Resent it/);
+  // Agents just write in the topic; no reply needed. Service messages are ignored.
+  const inTopic = (id, extra) => ({
+    update_id: id, message: { message_id: id, from: { id: 9, first_name: 'Admin' }, chat: { id: Number(cfg.supportChatId), type: 'supergroup' },
+      is_topic_message: true, message_thread_id: 77, ...extra },
+  });
+  api.clear();
+  await bot.handleUpdate(inTopic(6000, { forum_topic_edited: { name: 'x' } }));
+  assert.equal(api.calls.length, 0);
+  await bot.handleUpdate(inTopic(6001, { text: 'Refund issued' }));
+  assert.equal(api.of('sendMessage')[0].params.chat_id, alice.id);
+  assert.match(api.of('sendMessage')[0].params.text, /Refund issued/);
 
-  await app.bot.handleUpdate(callbackUpdate(u, 'support:close'));
-  assert.equal(app.store.openTicket(50), null);
-  assert.equal(app.api.of('closeForumTopic').length, 1);
+  api.clear();
+  await bot.handleUpdate(inTopic(6002, { text: '!close' }));
+  assert.equal(db.getOpenTicket(alice.id), null);
+  assert.deepEqual(api.of('closeForumTopic')[0].params, { chat_id: cfg.supportChatId, message_thread_id: 77 });
 });
 
-test('/paysupport without topics uses reply threads', async () => {
-  const app = await makeApp();
-  const u = user(51);
-  await app.bot.handleUpdate(textUpdate(u, '/paysupport'));
-  await app.bot.handleUpdate(textUpdate(u, 'charged twice'));
-  const copiedId = app.api.calls.findLast((c) => c.method === 'copyMessage');
-  const copyResultId = app.api.nextMessageId - 3; // copy result id precedes the label and the ack
-  await app.bot.handleUpdate({ message: { message_id: 11, from: user(999), chat: { id: -100500, type: 'supergroup' }, reply_to_message: { message_id: copyResultId }, text: 'Refund issued' } });
-  assert.ok(copiedId);
-  assert.match(app.api.texts(51).at(-1), /Refund issued/);
+test('/paysupport falls back to reply threads when topics are unavailable', async () => {
+  const ctx = setup();
+  const { bot, api, db } = ctx;
+  const call = api.call;
+  api.call = async (method, params) => {
+    if (method === 'createForumTopic') { api.calls.push({ method, params }); throw new Error('Bad Request: the chat is not a forum'); }
+    return call(method, params);
+  };
+  await bot.handleUpdate(msgUpdate(alice, '/paysupport'));
+  const header = api.of('sendMessage')[0];
+  assert.equal(header.params.message_thread_id, undefined);
+  assert.match(header.params.text, /Reply to any message/);
+  assert.equal(db.getOpenTicket(alice.id).thread_id, null);
 });
 
-test('refund goes through refundStarPayment with the stored charge id and removes the book', async () => {
-  const app = await makeApp();
-  await buyWithStars(app, user(60), 'automate-channel-ai', 'stxREFUND');
-  await app.bot.refund('stxREFUND');
-  const call = app.api.of('refundStarPayment')[0].params;
-  assert.deepEqual(call, { user_id: 60, telegram_payment_charge_id: 'stxREFUND' });
-  assert.equal(app.store.libraryBooks(60).length, 0);
-  assert.match(app.api.texts(60).at(-1), /Refund confirmed/);
-  await assert.rejects(app.bot.refund('stxREFUND'), /already refunded/);
-});
-
-test('the bot never mentions TON or links to the web checkout', async () => {
-  const app = await makeApp({ CHANNEL_ID: '' });
-  const u = user(70);
-  for (const cmd of ['/start', '/shelf', '/sample', '/library', '/invite', '/help', '/paysupport']) {
-    await app.bot.handleUpdate(textUpdate(u, cmd));
-  }
-  await buyWithStars(app, u, 'ai-control-center');
-  await app.bot.announceDrop(app.store.getBookBySlug('automate-channel-ai'), { webUrl: 'https://shop.example/book/x' });
-  const payload = JSON.stringify(app.api.calls.filter((c) => c.params.chat_id === 70).map((c) => c.params));
-  assert.doesNotMatch(payload, /\bTON\b|shop\.example|tonconnect/i);
-});
-
-test('drop announcement alerts opted-in users and posts to the channel with the web link', async () => {
-  const app = await makeApp({ CHANNEL_ID: '@YourShelf' });
-  await app.bot.handleUpdate(textUpdate(user(80), '/sample'));
-  await app.bot.handleUpdate(textUpdate(user(81), '/start'));
-  const book = app.store.startDrop('automate-channel-ai', 48);
-  app.api.reset();
-  const res = await app.bot.announceDrop(book, { webUrl: 'https://shop.example/book/automate-channel-ai' });
-  assert.deepEqual(res, { sent: 1, failed: 0 });
-  assert.equal(app.api.texts(81).length, 0);
-  const post = app.api.of('sendMessage').find((c) => c.params.chat_id === '@YourShelf');
-  assert.match(post.params.text, /@YourShelfBot/);
-  assert.ok(buttons(post).some((b) => b.url === 'https://t.me/YourShelfBot?start=buy_automate-channel-ai'));
-  assert.equal(app.store.activeBooks()[0].slug, 'automate-channel-ai');
-});
-
-test('staff close-ticket button only works from the support chat', async () => {
-  const app = await makeApp();
-  await app.bot.handleUpdate(textUpdate(user(52), '/paysupport'));
-  const ticket = app.store.openTicket(52);
-  await app.bot.handleUpdate(callbackUpdate(user(53), `tclose:${ticket.id}`));
-  assert.ok(app.store.openTicket(52), 'a user outside the support chat cannot close tickets');
-  await app.bot.handleUpdate({ callback_query: { id: 'x', from: user(999), data: `tclose:${ticket.id}`, message: { message_id: 1, chat: { id: -100500, type: 'supergroup' } } } });
-  assert.equal(app.store.openTicket(52), null);
+test('invoice payload round trip', () => {
+  const p = encodeInvoicePayload('ai-control-center', 450, 1800000000);
+  assert.deepEqual(decodeInvoicePayload(p), { bookId: 'ai-control-center', price: 450, at: 1800000000 });
+  assert.equal(decodeInvoicePayload('v1|x|y|z'), null);
 });

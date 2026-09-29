@@ -1,0 +1,47 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 6 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>
+endobj
+6 0 obj
+<< /Length 941 >>
+stream
+BT /F2 20 Tf 60 760 Td (Free chapter: AI daily brief to your Telegram) Tj ET
+BT /F1 12 Tf 60 724 Td (What you build: every morning, n8n reads your feeds, an AI model) Tj ET
+BT /F1 12 Tf 60 706 Td (summarizes them, and the brief lands in your Telegram chat.) Tj ET
+BT /F1 12 Tf 60 688 Td () Tj ET
+BT /F1 12 Tf 60 670 Td (1. Import daily-brief-workflow.json into n8n \(Workflows > Import from file\).) Tj ET
+BT /F1 12 Tf 60 652 Td (2. Set your feed URL in "Read feed".) Tj ET
+BT /F1 12 Tf 60 634 Td (3. Add OpenAI credentials to "Chat model".) Tj ET
+BT /F1 12 Tf 60 616 Td (4. Create a bot with @BotFather, add its token as Telegram credentials,) Tj ET
+BT /F1 12 Tf 60 598 Td (   and put your chat id in "Send brief".) Tj ET
+BT /F1 12 Tf 60 580 Td (5. Run it once with "Test workflow", then activate it.) Tj ET
+BT /F1 12 Tf 60 562 Td () Tj ET
+BT /F1 12 Tf 60 544 Td (PLACEHOLDER: replace with the finished, tested chapter before launch.) Tj ET
+endstream
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000251 00000 n 
+0000000321 00000 n 
+0000000396 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+1388
+%%EOF
