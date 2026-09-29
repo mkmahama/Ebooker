@@ -1,0 +1,23 @@
+{
+  "name": "drop-shelf",
+  "version": "1.0.0",
+  "description": "Drop Shelf v1: Telegram-native ebook shop (Stars in the bot, TON on the web)",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/index.js",
+    "seed": "node --disable-warning=ExperimentalWarning scripts/seed.js",
+    "admin": "node --disable-warning=ExperimentalWarning scripts/admin.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+  },
+  "dependencies": {
+    "pdf-lib": "^1.17.1"
+  },
+  "devDependencies": {
+    "@ton/core": "^0.63.1",
+    "@ton/crypto": "^3.3.0"
+  }
+}

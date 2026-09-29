@@ -1,0 +1,8 @@
+node_modules/
+.env
+data/
+*.db
+storage/books/**/*.epub
+storage/books/**/*.pdf
+storage/covers/*
+!storage/covers/.gitkeep

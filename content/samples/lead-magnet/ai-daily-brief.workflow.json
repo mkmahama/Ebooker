@@ -1,0 +1,127 @@
+{
+  "name": "AI Daily Brief to Telegram (Drop Shelf free chapter)",
+  "meta": { "dropShelf": "Telegram as Your AI Control Center, chapter 1", "testedWith": "n8n 2.x", "stampedOn": "2026-09-29" },
+  "nodes": [
+    {
+      "id": "b1f0c9a0-0001-4c1e-9a01-000000000001",
+      "name": "Every morning 07:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 300],
+      "parameters": { "rule": { "interval": [{ "field": "days", "triggerAtHour": 7 }] } }
+    },
+    {
+      "id": "b1f0c9a0-0002-4c1e-9a01-000000000002",
+      "name": "Today's calendar",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [220, 300],
+      "alwaysOutputData": true,
+      "parameters": {
+        "operation": "getAll",
+        "calendar": { "__rl": true, "mode": "list", "value": "primary" },
+        "returnAll": true,
+        "timeMin": "={{ $today.toISO() }}",
+        "timeMax": "={{ $today.plus({ days: 1 }).toISO() }}",
+        "options": { "singleEvents": true, "orderBy": "startTime" }
+      },
+      "credentials": { "googleCalendarOAuth2Api": { "id": "", "name": "Google Calendar account" } }
+    },
+    {
+      "id": "b1f0c9a0-0003-4c1e-9a01-000000000003",
+      "name": "Unread email (24h)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [440, 300],
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "parameters": {
+        "operation": "getAll",
+        "limit": 25,
+        "filters": { "q": "is:unread newer_than:1d -category:promotions -category:social" }
+      },
+      "credentials": { "gmailOAuth2": { "id": "", "name": "Gmail account" } }
+    },
+    {
+      "id": "b1f0c9a0-0004-4c1e-9a01-000000000004",
+      "name": "Industry news (RSS)",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.1,
+      "position": [660, 300],
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "parameters": { "url": "https://blog.n8n.io/rss/", "options": {} }
+    },
+    {
+      "id": "b1f0c9a0-0005-4c1e-9a01-000000000005",
+      "name": "Build prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Collect everything the brief needs into one compact prompt.\nconst safe = (name) => { try { return $(name).all().map(i => i.json).filter(j => Object.keys(j).length); } catch { return []; } };\n\nconst events = safe(\"Today's calendar\").map(e => `- ${e.start?.dateTime || e.start?.date || ''} ${e.summary || '(no title)'}${e.location ? ' @ ' + e.location : ''}`);\nconst mail = safe('Unread email (24h)').slice(0, 25).map(m => `- From ${m.From || m.from?.text || '?'}: ${m.Subject || m.subject || '(no subject)'} | ${(m.snippet || '').slice(0, 200)}`);\nconst news = safe('Industry news (RSS)').slice(0, 8).map(n => `- ${n.title} (${n.link})`);\n\nconst today = $today.toFormat('cccc d LLLL yyyy');\nconst prompt = [\n  `Today is ${today}. Write my morning brief.`,\n  '', 'CALENDAR:', events.join('\\n') || '- nothing scheduled',\n  '', 'UNREAD EMAIL:', mail.join('\\n') || '- inbox zero',\n  '', 'NEWS:', news.join('\\n') || '- no new items',\n].join('\\n');\n\nreturn [{ json: { prompt } }];"
+      }
+    },
+    {
+      "id": "b1f0c9a0-0006-4c1e-9a01-000000000006",
+      "name": "Claude: write the brief",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "anthropic-beta", "value": "server-side-fallback-2026-07-01" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: 'claude-opus-5-5',\n  max_tokens: 4000,\n  output_config: { effort: 'low' },\n  fallbacks: 'default',\n  system: 'You write a short morning brief that will be read on a phone in Telegram. Plain text only, no markdown symbols. Sections: TODAY (meetings with times, anything to prepare), INBOX (only emails that need a reply or action, one line each, most urgent first; say how many were skipped as low priority), WORTH READING (at most 3 news items, one line each). End with one line: FIRST THING: the single most important task. Keep it under 250 words. If a section has nothing, write none.',\n  messages: [{ role: 'user', content: $json.prompt }]\n}) }}",
+        "options": { "timeout": 120000 }
+      },
+      "credentials": { "httpHeaderAuth": { "id": "", "name": "Anthropic API key (x-api-key)" } }
+    },
+    {
+      "id": "b1f0c9a0-0007-4c1e-9a01-000000000007",
+      "name": "Format for Telegram",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The response holds content blocks; the brief is in the text block(s).\nconst res = $input.first().json;\nlet text;\nif (res.stop_reason === 'refusal') {\n  text = 'Daily brief: the model declined today\\'s input. Check the n8n execution log.';\n} else {\n  text = (res.content || []).filter(b => b.type === 'text').map(b => b.text).join('\\n').trim() || 'Daily brief: empty response.';\n}\n// Telegram messages max out at 4096 characters.\nconst chunks = [];\nfor (let i = 0; i < text.length; i += 4000) chunks.push({ json: { text: text.slice(i, i + 4000) } });\nreturn chunks;"
+      }
+    },
+    {
+      "id": "b1f0c9a0-0008-4c1e-9a01-000000000008",
+      "name": "Send to Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1540, 300],
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": { "appendAttribution": false }
+      },
+      "credentials": { "telegramApi": { "id": "", "name": "Telegram bot (your own bot token)" } }
+    }
+  ],
+  "connections": {
+    "Every morning 07:00": { "main": [[{ "node": "Today's calendar", "type": "main", "index": 0 }]] },
+    "Today's calendar": { "main": [[{ "node": "Unread email (24h)", "type": "main", "index": 0 }]] },
+    "Unread email (24h)": { "main": [[{ "node": "Industry news (RSS)", "type": "main", "index": 0 }]] },
+    "Industry news (RSS)": { "main": [[{ "node": "Build prompt", "type": "main", "index": 0 }]] },
+    "Build prompt": { "main": [[{ "node": "Claude: write the brief", "type": "main", "index": 0 }]] },
+    "Claude: write the brief": { "main": [[{ "node": "Format for Telegram", "type": "main", "index": 0 }]] },
+    "Format for Telegram": { "main": [[{ "node": "Send to Telegram", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1", "timezone": "UTC" },
+  "pinData": {}
+}
